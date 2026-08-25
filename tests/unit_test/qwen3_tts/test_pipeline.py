@@ -3985,7 +3985,12 @@ def test_qwen3_tts_prepare_decode_buffers_collects_private_subtalker_seeds(
     talker._sub_top_k_tensor = torch.empty(2, dtype=torch.long)
     talker._semantic_sampling_seed_tensor = torch.empty(2, dtype=torch.long)
     talker._sub_sampling_seed_tensor = torch.empty(2, dtype=torch.long)
+    talker._sub_graph_temperature_tensor = torch.empty(2, dtype=torch.float32)
+    talker._sub_graph_top_p_tensor = torch.empty(2, dtype=torch.float32)
+    talker._sub_graph_top_k_tensor = torch.empty(2, dtype=torch.long)
+    talker._sub_graph_sampling_seed_tensor = torch.empty(2, dtype=torch.long)
     talker._sub_sample_row_indices_tensor = torch.empty(2, dtype=torch.long)
+    talker._sub_sample_mask_tensor = torch.empty(2, dtype=torch.bool)
     requests = [
         SimpleNamespace(
             data=Qwen3TTSSGLangRequestData(
@@ -4015,6 +4020,9 @@ def test_qwen3_tts_prepare_decode_buffers_collects_private_subtalker_seeds(
     assert talker._semantic_sampling_seed_tensor[:2].tolist() == [5, 9]
     assert talker._sub_sampling_seed_tensor[:2].tolist() == [7, 11]
     assert talker._sub_temperature_tensor[:2].tolist() == pytest.approx([0.8, 1.0])
+    assert talker._sub_graph_sampling_seed_tensor[:2].tolist() == [7, 0]
+    assert talker._sub_graph_top_k_tensor[:2].tolist() == [40, 50]
+    assert talker._sub_sample_mask_tensor[:2].tolist() == [True, False]
     assert talker._sub_sample_rows == [0]
     assert talker._sub_sample_count == 1
     assert talker._sub_sample_row_indices_tensor[:1].tolist() == [0]
@@ -4678,7 +4686,12 @@ def _make_prep_talker(monkeypatch):
     talker._sub_top_k_tensor = torch.empty(2, dtype=torch.long)
     talker._semantic_sampling_seed_tensor = torch.empty(2, dtype=torch.long)
     talker._sub_sampling_seed_tensor = torch.empty(2, dtype=torch.long)
+    talker._sub_graph_temperature_tensor = torch.empty(2, dtype=torch.float32)
+    talker._sub_graph_top_p_tensor = torch.empty(2, dtype=torch.float32)
+    talker._sub_graph_top_k_tensor = torch.empty(2, dtype=torch.long)
+    talker._sub_graph_sampling_seed_tensor = torch.empty(2, dtype=torch.long)
     talker._sub_sample_row_indices_tensor = torch.empty(2, dtype=torch.long)
+    talker._sub_sample_mask_tensor = torch.empty(2, dtype=torch.bool)
     return Qwen3TTSTalker, talker
 
 

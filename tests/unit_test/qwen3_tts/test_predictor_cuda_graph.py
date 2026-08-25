@@ -109,12 +109,31 @@ def _build_talker(device: torch.device) -> Qwen3TTSTalker:
     talker._sub_sampling_seed_tensor = torch.zeros(
         MAX_BS, device=device, dtype=torch.long
     )
+    talker._sub_graph_temperature_tensor = torch.ones(
+        MAX_BS, device=device, dtype=torch.float32
+    )
+    talker._sub_graph_top_p_tensor = torch.ones(
+        MAX_BS, device=device, dtype=torch.float32
+    )
+    talker._sub_graph_top_k_tensor = torch.zeros(
+        MAX_BS, device=device, dtype=torch.long
+    )
+    talker._sub_graph_sampling_seed_tensor = torch.zeros(
+        MAX_BS, device=device, dtype=torch.long
+    )
     talker._sub_sample_rows = []
     talker._sub_sample_row_indices_tensor = torch.zeros(
         MAX_BS, device=device, dtype=torch.long
     )
+    talker._sub_all_row_indices_tensor = torch.arange(
+        MAX_BS, device=device, dtype=torch.long
+    )
+    talker._sub_sample_mask_tensor = torch.zeros(
+        MAX_BS, device=device, dtype=torch.bool
+    )
     talker._sub_sample_count = 0
     talker._sub_has_sampled_rows = False
+    talker._sub_fixed_shape_mixed_sampling = False
     talker._sub_sampled_has_top_p = False
     talker._sub_sampled_max_top_k = 0
     talker._sub_sampled_has_unbounded_top_k = False
@@ -332,21 +351,92 @@ def test_graph_multi_step_replay_bit_identity():
     assert len(talker._predictor_graphs) == 1
 
 
+def test_mixed_sampled_argmax_rows_have_bounded_graph_signature():
+    """The graph key must not depend on the exact mixed row mask."""
+    talker = object.__new__(Qwen3TTSTalker)
+    talker._sub_has_sampled_rows = True
+    talker._sub_sample_count = 2
+    talker._sub_sampled_max_top_k = 8
+    talker._sub_sampled_has_top_p = True
+    talker._sub_sampled_has_unbounded_top_k = False
+    positions = SimpleNamespace(is_cuda=True, ndim=1, shape=(4,))
+
+    assert talker._predictor_graph_signature(4, positions) == (
+        "mixed",
+        8,
+        True,
+        False,
+    )
+
+
 @pytest.mark.accelerator
 @pytest.mark.skipif(not _HAS_CUDA, reason="predictor CUDA graph needs CUDA")
-def test_mixed_sampled_argmax_rows_fall_back_to_eager():
+@pytest.mark.parametrize(
+    "sample_mask",
+    [
+        [True, False],
+        [False, True, False],
+        [True, False, True, False],
+        [False, True, True, False, True],
+    ],
+)
+def test_graph_bit_identity_mixed_sampled_argmax_rows(sample_mask: list[bool]):
     device = torch.device("cuda")
     talker = _build_talker(device)
-    requests = [_request(dosample=True), _request(dosample=False)]
+    requests = [
+        _request(
+            dosample=do_sample,
+            temperature=0.7 + 0.1 * row_idx,
+            top_p=0.8 if do_sample else 0.0,
+            top_k=3 + row_idx if do_sample else 0,
+            sub_seed=1000 + row_idx,
+            semantic_seed=2000 + row_idx,
+        )
+        for row_idx, do_sample in enumerate(sample_mask)
+    ]
     talker.prepare_decode_buffers(requests)
-    layer0, hidden, positions = _step_inputs(2, device)
+    layer0, hidden, positions = _step_inputs(len(requests), device)
 
     eager_codes, eager_embeds = _run_eager(talker, layer0, hidden, positions)
     graph_codes, graph_embeds = _run_forward(talker, layer0, hidden, positions)
 
-    assert not talker._predictor_graphs, "mixed batches must not capture a graph"
+    assert any(key[1] == "mixed" for key in talker._predictor_graphs)
     assert torch.equal(graph_codes, eager_codes)
     assert torch.equal(graph_embeds, eager_embeds)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not _HAS_CUDA, reason="predictor CUDA graph needs CUDA")
+def test_mixed_row_mask_changes_reuse_one_graph():
+    device = torch.device("cuda")
+    talker = _build_talker(device)
+    masks = [
+        [True, False, True, False],
+        [False, True, False, True],
+        [True, True, True, False],
+    ]
+
+    for step, sample_mask in enumerate(masks):
+        requests = [
+            _request(
+                dosample=do_sample,
+                temperature=0.8 + 0.05 * row_idx,
+                top_p=0.9 if do_sample else 0.0,
+                top_k=5 if do_sample else 0,
+                sub_seed=3000 + 10 * step + row_idx,
+                semantic_seed=4000 + row_idx,
+            )
+            for row_idx, do_sample in enumerate(sample_mask)
+        ]
+        talker.prepare_decode_buffers(requests)
+        layer0, hidden, positions = _step_inputs(4, device, step=step)
+        eager_codes, eager_embeds = _run_eager(talker, layer0, hidden, positions)
+        graph_codes, graph_embeds = _run_forward(talker, layer0, hidden, positions)
+        assert torch.equal(graph_codes, eager_codes), f"mask={sample_mask}"
+        assert torch.equal(graph_embeds, eager_embeds), f"mask={sample_mask}"
+
+    assert len(talker._predictor_graphs) == 1
+    assert next(iter(talker._predictor_graphs))[1] == "mixed"
 
 
 @pytest.mark.accelerator
