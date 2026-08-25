@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import struct
 import sys
 import types
@@ -1798,6 +1799,262 @@ def test_encode_audio_stereo_wav_and_mono_fallback():
         np.ones(64, dtype=np.float32) * 0.1, response_format="wav", sample_rate=48000
     )
     assert struct.unpack("<H", mono_blob[22:24])[0] == 1
+
+
+def _moss_local_prefill_runner():
+    from sglang_omni.models.moss_tts_local.model_runner import MossTTSLocalModelRunner
+
+    class FakeModel:
+        dtype = torch.float32
+        hidden_size = 2
+
+        _state_pool = types.SimpleNamespace(
+            reset_for_refill=lambda *_args: None,
+            rebuild_audio_history=lambda *_args: None,
+        )
+
+        def _prepare_multi_modal_inputs(self, rows):
+            return rows.to(torch.float32)[:, :2]
+
+    runner = MossTTSLocalModelRunner.__new__(MossTTSLocalModelRunner)
+    runner.model = FakeModel()
+    return runner
+
+
+def _moss_local_prefill_request(
+    prompt_rows: torch.Tensor,
+    *,
+    request_id: str = "request",
+    prefix_len: int = 1,
+    extend_len: int = 2,
+):
+    return types.SimpleNamespace(
+        request_id=request_id,
+        data=types.SimpleNamespace(
+            req=types.SimpleNamespace(
+                rid=request_id,
+                extend_range=types.SimpleNamespace(length=extend_len),
+                prefix_indices=list(range(prefix_len)),
+            ),
+            prompt_rows=prompt_rows,
+            output_rows=[],
+            generation_steps=0,
+            sampling_steps=0,
+        )
+    )
+
+
+def _moss_local_forward_batch(
+    input_ids: torch.Tensor | None = None,
+    *,
+    rids: list[str] | None = None,
+):
+    if input_ids is None:
+        input_ids = torch.tensor([123456, 123457], dtype=torch.long)
+    if rids is None:
+        rids = ["request"]
+    return types.SimpleNamespace(
+        input_ids=input_ids,
+        positions=torch.arange(len(input_ids)),
+        mrope_positions=None,
+        input_embeds=None,
+        replace_embeds=None,
+        replace_positions=None,
+        mm_inputs=[None] * len(rids),
+        batch_size=len(rids),
+        rids=rids,
+    )
+
+
+def _moss_local_late_prefill_kwargs(forward_batch):
+    from sglang_omni.model_runner.sglang_model_runner import SGLModelRunner
+
+    runner = SGLModelRunner.__new__(SGLModelRunner)
+    runner.support_pp = False
+    runner.is_generation = True
+    return runner._extend_forward_kwargs(forward_batch, object())
+
+
+def test_moss_local_prefill_preserves_multi_request_order_and_rid_alignment():
+    from sglang_omni.model_runner.prefill_inputs import get_omni_prefill_inputs
+
+    runner = _moss_local_prefill_runner()
+    forward_batch = _moss_local_forward_batch(
+        torch.tensor([123456, 123457, 123458], dtype=torch.long),
+        rids=["request-a", "request-b"],
+    )
+    original_input_ids = forward_batch.input_ids.clone()
+    requests = [
+        _moss_local_prefill_request(
+            torch.tensor(
+                [[1, 2, 9], [3, 4, 9], [5, 6, 9]],
+                dtype=torch.long,
+            ),
+            request_id="request-a",
+            prefix_len=1,
+            extend_len=2,
+        ),
+        _moss_local_prefill_request(
+            torch.tensor(
+                [[10, 20, 9], [30, 40, 9], [50, 60, 9]],
+                dtype=torch.long,
+            ),
+            request_id="request-b",
+            prefix_len=2,
+            extend_len=1,
+        ),
+    ]
+
+    result = runner.custom_prefill_forward(forward_batch, object(), requests)
+
+    assert result is None
+    assert torch.equal(forward_batch.input_ids, original_input_ids)
+    assert forward_batch.input_embeds is None
+    prefill_inputs = get_omni_prefill_inputs(forward_batch)
+    assert prefill_inputs is not None
+    torch.testing.assert_close(
+        prefill_inputs.input_embeds,
+        torch.tensor([[3.0, 4.0], [5.0, 6.0], [50.0, 60.0]]),
+    )
+
+    kwargs = _moss_local_late_prefill_kwargs(forward_batch)
+    assert kwargs["input_embeds"] is prefill_inputs.input_embeds
+    assert kwargs["omni_prefill_rids"] is forward_batch.rids
+    assert kwargs["omni_prefill_rids"] == ["request-a", "request-b"]
+    assert forward_batch.input_embeds is None
+
+
+def test_moss_local_prefill_late_transport_rebuilds_same_token_count_a_b_a():
+    from sglang_omni.model_runner.prefill_inputs import get_omni_prefill_inputs
+
+    runner = _moss_local_prefill_runner()
+    prompt_rows_by_request = (
+        torch.tensor([[0, 0, 0], [1, 2, 3], [4, 5, 6]]),
+        torch.tensor([[0, 0, 0], [10, 20, 30], [40, 50, 60]]),
+        torch.tensor([[0, 0, 0], [1, 2, 3], [4, 5, 6]]),
+    )
+    expected_by_request = (
+        torch.tensor([[1.0, 2.0], [4.0, 5.0]]),
+        torch.tensor([[10.0, 20.0], [40.0, 50.0]]),
+        torch.tensor([[1.0, 2.0], [4.0, 5.0]]),
+    )
+
+    observed = []
+    for index, (prompt_rows, expected) in enumerate(
+        zip(prompt_rows_by_request, expected_by_request)
+    ):
+        rid = f"request-{index}"
+        forward_batch = _moss_local_forward_batch(rids=[rid])
+        request = _moss_local_prefill_request(prompt_rows, request_id=rid)
+        runner.custom_prefill_forward(forward_batch, object(), [request])
+        prefill_inputs = get_omni_prefill_inputs(forward_batch)
+        assert prefill_inputs is not None
+
+        kwargs = _moss_local_late_prefill_kwargs(forward_batch)
+        assert kwargs["input_embeds"] is prefill_inputs.input_embeds
+        assert kwargs["omni_prefill_rids"] is forward_batch.rids
+        observed.append(kwargs["input_embeds"].clone())
+        torch.testing.assert_close(kwargs["input_embeds"], expected)
+        assert forward_batch.input_embeds is None
+
+    assert not torch.equal(observed[0], observed[1])
+    torch.testing.assert_close(observed[2], observed[0])
+
+
+def test_moss_local_prefill_forward_uses_private_prompt_embedding_sidecar():
+    from sglang_omni.model_runner.prefill_inputs import get_omni_prefill_inputs
+
+    runner = _moss_local_prefill_runner()
+    forward_batch = _moss_local_forward_batch()
+    original_input_ids = forward_batch.input_ids.clone()
+    request = _moss_local_prefill_request(
+        torch.tensor(
+            [[1, 2, 3], [4, 5, 6], [7, 8, 9]],
+            dtype=torch.long,
+        )
+    )
+
+    result = runner.custom_prefill_forward(forward_batch, object(), [request])
+
+    assert result is None
+    assert torch.equal(forward_batch.input_ids, original_input_ids)
+    assert forward_batch.input_embeds is None
+    prefill_inputs = get_omni_prefill_inputs(forward_batch)
+    assert prefill_inputs is not None
+    torch.testing.assert_close(
+        prefill_inputs.input_embeds,
+        torch.tensor([[4.0, 5.0], [7.0, 8.0]]),
+    )
+
+
+@pytest.mark.parametrize("forward_fails", [False, True])
+def test_moss_local_prefill_sidecar_is_cleared_after_forward(forward_fails: bool):
+    from sglang_omni.model_runner.prefill_inputs import get_omni_prefill_inputs
+
+    runner = _moss_local_prefill_runner()
+    forward_batch = _moss_local_forward_batch()
+    request = _moss_local_prefill_request(
+        torch.tensor([[0, 0, 0], [1, 2, 3], [4, 5, 6]])
+    )
+    forwarded_payloads = []
+
+    def forward_batch_generation(batch):
+        forwarded_payloads.append(get_omni_prefill_inputs(batch))
+        if forward_fails:
+            raise RuntimeError("forward failed")
+        return types.SimpleNamespace(next_token_ids=None)
+
+    runner.tp_worker = types.SimpleNamespace(
+        forward_batch_generation=forward_batch_generation
+    )
+    schedule_batch = types.SimpleNamespace(is_prefill_only=True)
+
+    if forward_fails:
+        with pytest.raises(RuntimeError, match="forward failed"):
+            runner._prepare_and_forward(
+                forward_batch,
+                schedule_batch,
+                [request],
+                True,
+            )
+    else:
+        runner._prepare_and_forward(
+            forward_batch,
+            schedule_batch,
+            [request],
+            True,
+        )
+
+    assert forwarded_payloads[0] is not None
+    assert get_omni_prefill_inputs(forward_batch) is None
+
+
+def test_moss_local_model_forward_accepts_shared_prefill_transport_kwargs():
+    from sglang_omni.models.moss_tts_local.sglang_model import (
+        MossTTSLocalSGLangModel,
+    )
+
+    params = inspect.signature(MossTTSLocalSGLangModel.forward).parameters
+    assert "omni_prefill_rids" in params
+    assert "input_embeds_are_projected" in params
+
+
+def test_moss_local_builder_allows_breakable_prefill_as_opt_in():
+    from sglang_omni.models.moss_tts_local.engine_builder import (
+        MossTtsLocalEngineBuilder,
+    )
+
+    builder = MossTtsLocalEngineBuilder(
+        enable_async_decode=False,
+        async_decode_min_batch_size=2,
+        total_gpu_memory_fraction=None,
+        codec_mem_reserve=0.05,
+    )
+
+    assert builder.supports_breakable_prefill_cuda_graph is True
+    assert "cuda_graph_backend_prefill" not in builder.generation_defaults(
+        dtype="bfloat16"
+    )
 
 
 def test_post_process_outputs_skips_chunked_rows():
