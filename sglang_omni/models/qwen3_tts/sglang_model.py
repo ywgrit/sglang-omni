@@ -68,8 +68,8 @@ class _PredictorDecodeGraph:
     """CUDA graph over the full per-token predictor chain for one batch bucket.
 
     One graph per (bucket, sampling signature): the signature pins the host
-    branches of the eager sampling path (argmax vs all-rows-sampled, top-k
-    bound, top-p presence), so replay reproduces the eager sampling bits.
+    branches of the eager sampling path (argmax, all-rows-sampled, or mixed;
+    top-k bound; top-p presence), so replay reproduces the eager sampling bits.
     Per-step inputs reach the captured region through persistent device
     buffers written with device-side copies before replay.
     """
@@ -497,12 +497,31 @@ class Qwen3TTSTalker(nn.Module):
         self._sub_sampling_seed_tensor = torch.zeros(
             max_batch_size, device=device, dtype=torch.long
         )
+        self._sub_graph_temperature_tensor = torch.ones(
+            max_batch_size, device=device, dtype=torch.float32
+        )
+        self._sub_graph_top_p_tensor = torch.ones(
+            max_batch_size, device=device, dtype=torch.float32
+        )
+        self._sub_graph_top_k_tensor = torch.zeros(
+            max_batch_size, device=device, dtype=torch.long
+        )
+        self._sub_graph_sampling_seed_tensor = torch.zeros(
+            max_batch_size, device=device, dtype=torch.long
+        )
         self._sub_sample_rows: list[int] = []
         self._sub_sample_row_indices_tensor = torch.empty(
             max_batch_size, device=device, dtype=torch.long
         )
+        self._sub_all_row_indices_tensor = torch.arange(
+            max_batch_size, device=device, dtype=torch.long
+        )
+        self._sub_sample_mask_tensor = torch.zeros(
+            max_batch_size, device=device, dtype=torch.bool
+        )
         self._sub_sample_count = 0
         self._sub_has_sampled_rows = False
+        self._sub_fixed_shape_mixed_sampling = False
         self._sub_sampled_has_top_p = False
         self._sub_sampled_max_top_k = 0
         self._sub_sampled_has_unbounded_top_k = False
@@ -1001,6 +1020,7 @@ class Qwen3TTSTalker(nn.Module):
         sub_top_ps: list[float] = []
         sub_top_ks: list[int] = []
         sub_seeds: list[int] = []
+        sub_sample_mask: list[bool] = []
         self._sub_sample_rows = []
         for row_idx, sched_req in enumerate(requests):
             data = sched_req.data
@@ -1026,6 +1046,7 @@ class Qwen3TTSTalker(nn.Module):
             sub_top_ps.append(subtalker_top_p)
             sub_top_ks.append(subtalker_top_k)
             sub_seeds.append(subtalker_seed)
+            sub_sample_mask.append(do_sample)
             if do_sample:
                 self._sub_sample_rows.append(row_idx)
 
@@ -1056,6 +1077,22 @@ class Qwen3TTSTalker(nn.Module):
         self._sub_sampled_max_top_k = max_top_k
         self._sub_sampled_has_unbounded_top_k = has_unbounded_top_k
 
+        # Fixed-shape mixed Graph capture evaluates a sampled candidate for
+        # every row before selecting argmax rows with a device mask. Build a
+        # separate safe view for that path; the ordinary request buffers retain
+        # their exact values for eager execution and observability.
+        safe_top_k = max_top_k if max_top_k > 0 else 0
+        graph_temperatures = list(sub_temperatures)
+        graph_top_ps = list(sub_top_ps)
+        graph_top_ks = list(sub_top_ks)
+        graph_seeds = list(sub_seeds)
+        for row_idx, do_sample in enumerate(sub_sample_mask):
+            if not do_sample:
+                graph_temperatures[row_idx] = 1.0
+                graph_top_ps[row_idx] = 1.0
+                graph_top_ks[row_idx] = safe_top_k
+                graph_seeds[row_idx] = 0
+
         if batch_size == 0:
             self._decode_prep_rids = rids
             return
@@ -1078,10 +1115,46 @@ class Qwen3TTSTalker(nn.Module):
         self._sub_sampling_seed_tensor[:batch_size] = torch.tensor(
             sub_seeds, device=device, dtype=self._sub_sampling_seed_tensor.dtype
         )
+        self._sub_graph_temperature_tensor[:batch_size] = torch.tensor(
+            graph_temperatures,
+            device=device,
+            dtype=self._sub_graph_temperature_tensor.dtype,
+        )
+        self._sub_graph_top_p_tensor[:batch_size] = torch.tensor(
+            graph_top_ps,
+            device=device,
+            dtype=self._sub_graph_top_p_tensor.dtype,
+        )
+        self._sub_graph_top_k_tensor[:batch_size] = torch.tensor(
+            graph_top_ks,
+            device=device,
+            dtype=self._sub_graph_top_k_tensor.dtype,
+        )
+        self._sub_graph_sampling_seed_tensor[:batch_size] = torch.tensor(
+            graph_seeds,
+            device=device,
+            dtype=self._sub_graph_sampling_seed_tensor.dtype,
+        )
+        capacity = self._sub_temperature_tensor.shape[0]
+        if batch_size < capacity:
+            # Bucket padding participates in the fixed-shape sampled candidate
+            # computation. Keep those discarded rows finite across graph keys,
+            # even when a previous larger batch left different parameters.
+            self._sub_graph_temperature_tensor[batch_size:].fill_(1.0)
+            self._sub_graph_top_p_tensor[batch_size:].fill_(1.0)
+            self._sub_graph_top_k_tensor[batch_size:].fill_(safe_top_k)
+            self._sub_graph_sampling_seed_tensor[batch_size:].zero_()
+            self._semantic_sampling_seed_tensor[batch_size:].zero_()
         if self._sub_sample_count:
             self._sub_sample_row_indices_tensor[: self._sub_sample_count] = (
                 torch.tensor(self._sub_sample_rows, device=device, dtype=torch.long)
             )
+        self._sub_sample_mask_tensor.zero_()
+        self._sub_sample_mask_tensor[:batch_size] = torch.tensor(
+            sub_sample_mask,
+            device=device,
+            dtype=torch.bool,
+        )
         self._decode_prep_rids = rids
 
     @torch.no_grad()
@@ -1199,12 +1272,11 @@ class Qwen3TTSTalker(nn.Module):
             return ("argmax", 0, False, False)
         if semantic_positions is None:
             return None
-        if self._sub_sample_count != batch_size:
-            # Note: (Jiaxin Deng) mixed sampled/argmax batches take
-            # count-dependent shapes; they stay on the eager path.
-            return None
+        sampling_mode = (
+            "sampled" if self._sub_sample_count == batch_size else "mixed"
+        )
         return (
-            "sampled",
+            sampling_mode,
             int(self._sub_sampled_max_top_k),
             bool(self._sub_sampled_has_top_p),
             bool(self._sub_sampled_has_unbounded_top_k),
@@ -1217,16 +1289,24 @@ class Qwen3TTSTalker(nn.Module):
             self._sub_sample_count,
             self._sub_sample_rows,
             self._sub_has_sampled_rows,
+            self._sub_fixed_shape_mixed_sampling,
             self._sub_sampled_has_top_p,
             self._sub_sampled_max_top_k,
             self._sub_sampled_has_unbounded_top_k,
         )
-        sampled = signature[0] == "sampled"
+        sampling_mode = signature[0]
+        sampled = sampling_mode == "sampled"
+        mixed = sampling_mode == "mixed"
         try:
             self._sub_batch_size = bucket_size
-            self._sub_has_sampled_rows = sampled
-            self._sub_sample_count = bucket_size if sampled else 0
-            self._sub_sample_rows = list(range(bucket_size)) if sampled else []
+            self._sub_has_sampled_rows = sampled or mixed
+            self._sub_fixed_shape_mixed_sampling = mixed
+            if sampled:
+                self._sub_sample_count = bucket_size
+                self._sub_sample_rows = list(range(bucket_size))
+            elif not mixed:
+                self._sub_sample_count = 0
+                self._sub_sample_rows = []
             _, max_top_k, has_top_p, has_unbounded_top_k = signature
             self._sub_sampled_max_top_k = max_top_k
             self._sub_sampled_has_top_p = has_top_p
@@ -1246,6 +1326,7 @@ class Qwen3TTSTalker(nn.Module):
                 self._sub_sample_count,
                 self._sub_sample_rows,
                 self._sub_has_sampled_rows,
+                self._sub_fixed_shape_mixed_sampling,
                 self._sub_sampled_has_top_p,
                 self._sub_sampled_max_top_k,
                 self._sub_sampled_has_unbounded_top_k,
@@ -1449,6 +1530,32 @@ class Qwen3TTSTalker(nn.Module):
         if not self._sub_has_sampled_rows:
             return torch.argmax(logits, dim=-1).to(dtype=torch.long)
 
+        if getattr(self, "_sub_fixed_shape_mixed_sampling", False):
+            if semantic_positions is None:
+                raise RuntimeError(
+                    "Qwen3-TTS sampled subtalker rows require positions"
+                )
+            semantic_positions = semantic_positions.to(
+                device=logits.device, dtype=torch.long
+            )
+            if (
+                semantic_positions.ndim != 1
+                or semantic_positions.shape[0] != batch_size
+            ):
+                raise ValueError("Qwen3-TTS subtalker positions shape mismatch")
+            all_rows = self._sub_all_row_indices_tensor[:batch_size]
+            sampled = self._sample_subtalker_token_seeded(
+                logits,
+                layer_idx,
+                row_indices=all_rows,
+                semantic_positions=semantic_positions,
+                graph_safe_params=True,
+            )
+            argmax = torch.argmax(logits, dim=-1).to(dtype=torch.long)
+            return torch.where(
+                self._sub_sample_mask_tensor[:batch_size], sampled, argmax
+            )
+
         if self._sub_sample_rows[-1] >= batch_size:
             raise RuntimeError("Qwen3-TTS sampled row index exceeds batch size")
         sampled_rows = self._sub_sample_row_indices_tensor[: self._sub_sample_count]
@@ -1496,16 +1603,37 @@ class Qwen3TTSTalker(nn.Module):
         *,
         row_indices: torch.Tensor,
         semantic_positions: torch.Tensor,
+        graph_safe_params: bool = False,
     ) -> torch.Tensor:
         row_indices = row_indices.to(device=logits.device, dtype=torch.long)
         scores = logits.float()
-        temperatures = self._sub_temperature_tensor.index_select(
+        temperature_tensor = (
+            self._sub_graph_temperature_tensor
+            if graph_safe_params
+            else self._sub_temperature_tensor
+        )
+        top_k_tensor = (
+            self._sub_graph_top_k_tensor
+            if graph_safe_params
+            else self._sub_top_k_tensor
+        )
+        top_p_tensor = (
+            self._sub_graph_top_p_tensor
+            if graph_safe_params
+            else self._sub_top_p_tensor
+        )
+        seed_tensor = (
+            self._sub_graph_sampling_seed_tensor
+            if graph_safe_params
+            else self._sub_sampling_seed_tensor
+        )
+        temperatures = temperature_tensor.index_select(
             0, row_indices
         ).clamp_min(1e-5)
         scores = scores / temperatures.unsqueeze(1)
 
         vocab_size = int(logits.shape[-1])
-        top_ks = self._sub_top_k_tensor.index_select(0, row_indices)
+        top_ks = top_k_tensor.index_select(0, row_indices)
         max_top_k = int(self._sub_sampled_max_top_k)
         has_unbounded_top_k = bool(self._sub_sampled_has_unbounded_top_k)
         if max_top_k > 0 and max_top_k < vocab_size and not has_unbounded_top_k:
@@ -1520,8 +1648,8 @@ class Qwen3TTSTalker(nn.Module):
             keep_top_k = keep_all.unsqueeze(1) | (rank < top_ks.unsqueeze(1))
             sorted_scores = sorted_scores.masked_fill(~keep_top_k, -float("inf"))
 
-        top_ps = self._sub_top_p_tensor.index_select(0, row_indices)
-        seeds = self._sub_sampling_seed_tensor.index_select(0, row_indices)
+        top_ps = top_p_tensor.index_select(0, row_indices)
+        seeds = seed_tensor.index_select(0, row_indices)
         sub_positions = (
             semantic_positions.to(device=logits.device, dtype=torch.long)
             * max(int(self.config.num_code_groups) - 1, 1)
